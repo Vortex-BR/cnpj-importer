@@ -1,0 +1,7 @@
+fastapi==0.115.12
+httpx==0.28.1
+psycopg[binary,pool]==3.2.9
+pydantic-settings==2.9.1
+PyYAML==6.0.2
+uvicorn[standard]==0.34.3
+
