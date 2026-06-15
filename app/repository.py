@@ -5,7 +5,13 @@ from typing import Iterable, Sequence
 
 from psycopg import sql
 
-from app.models import AutoRetryState, CompanyRecord, EstablishmentRecord, SourceFile
+from app.models import (
+    AutoRetryState,
+    CompanyRecord,
+    EstablishmentRecord,
+    PartnerRecord,
+    SourceFile,
+)
 
 
 class ActiveRunConflict(RuntimeError):
@@ -17,6 +23,10 @@ class ActiveRunConflict(RuntimeError):
 COMPANY_CANDIDATE_SQL = """
 SELECT
     establishment.cnpj,
+    establishment.cnpj_basico,
+    establishment.cnpj_ordem,
+    establishment.cnpj_dv,
+    establishment.is_matriz,
     company.razao_social,
     CASE COALESCE(NULLIF(company.porte_codigo, ''), '00')
         WHEN '01' THEN 'MICRO EMPRESA'
@@ -59,6 +69,10 @@ LEFT JOIN stg_cnaes AS cnae
 COMPANY_UPSERT_SQL = f"""
 INSERT INTO companies (
     cnpj,
+    cnpj_basico,
+    cnpj_ordem,
+    cnpj_dv,
+    is_matriz,
     razao_social,
     porte,
     porte_normalizado,
@@ -80,6 +94,10 @@ INSERT INTO companies (
 )
 SELECT
     candidate.cnpj,
+    candidate.cnpj_basico,
+    candidate.cnpj_ordem,
+    candidate.cnpj_dv,
+    candidate.is_matriz,
     candidate.razao_social,
     candidate.porte,
     candidate.porte_normalizado,
@@ -102,6 +120,10 @@ FROM ({COMPANY_CANDIDATE_SQL}) AS candidate
 ON CONFLICT (cnpj)
 DO UPDATE SET
     razao_social = EXCLUDED.razao_social,
+    cnpj_basico = EXCLUDED.cnpj_basico,
+    cnpj_ordem = EXCLUDED.cnpj_ordem,
+    cnpj_dv = EXCLUDED.cnpj_dv,
+    is_matriz = EXCLUDED.is_matriz,
     porte = EXCLUDED.porte,
     porte_normalizado = EXCLUDED.porte_normalizado,
     natureza_juridica = EXCLUDED.natureza_juridica,
@@ -654,7 +676,25 @@ class ImportRepository:
                 stg_naturezas,
                 stg_municipios,
                 stg_cnaes,
-                stg_estabelecimentos_ativos
+                stg_estabelecimentos_ativos,
+                stg_qualificacoes,
+                stg_company_partners
+            """
+        )
+
+    def truncate_company_staging(self, connection) -> None:
+        """Libera staging de empresas e auxiliares após Fase 3.
+
+        Preserva stg_qualificacoes, necessária para promote_partners.
+        """
+        connection.execute(
+            """
+            TRUNCATE
+                stg_empresas,
+                stg_mei,
+                stg_naturezas,
+                stg_municipios,
+                stg_cnaes
             """
         )
 
@@ -712,6 +752,9 @@ class ImportRepository:
             (
                 "cnpj",
                 "cnpj_basico",
+                "cnpj_ordem",
+                "cnpj_dv",
+                "is_matriz",
                 "data_abertura",
                 "cnae_principal",
                 "uf",
@@ -722,11 +765,55 @@ class ImportRepository:
                 (
                     row.cnpj,
                     row.cnpj_basico,
+                    row.cnpj_ordem or row.cnpj[8:12],
+                    row.cnpj_dv or row.cnpj[12:14],
+                    (row.cnpj_ordem or row.cnpj[8:12]) == "0001",
                     row.data_abertura,
                     row.cnae_principal,
                     row.uf,
                     row.municipio_codigo,
                     row.situacao_cadastral,
+                )
+                for row in rows
+            ),
+        )
+
+    def copy_partners(
+        self,
+        connection,
+        rows: Iterable[PartnerRecord],
+    ) -> None:
+        self._copy_rows(
+            connection,
+            "stg_company_partners",
+            (
+                "cnpj_basico",
+                "partner_identifier",
+                "partner_name",
+                "partner_document",
+                "partner_qualification_code",
+                "entry_date",
+                "country_code",
+                "legal_representative_document",
+                "legal_representative_name",
+                "legal_representative_qualification_code",
+                "age_range_code",
+                "age_range",
+            ),
+            (
+                (
+                    row.cnpj_basico,
+                    row.partner_identifier,
+                    row.partner_name,
+                    row.partner_document,
+                    row.partner_qualification_code,
+                    row.entry_date,
+                    row.country_code,
+                    row.legal_representative_document,
+                    row.legal_representative_name,
+                    row.legal_representative_qualification_code,
+                    row.age_range_code,
+                    row.age_range,
                 )
                 for row in rows
             ),
@@ -858,7 +945,13 @@ class ImportRepository:
             VALUES (%s, %s, %s, %s, %s)
         """
         params = [
-            (run_id, source_month, file_name, cnpj, message[:1000])
+            (
+                run_id,
+                source_month,
+                file_name,
+                cnpj,
+                message[:1000],
+            )
             for cnpj, message in errors[:remaining]
         ]
         with connection.cursor() as cursor:
@@ -906,6 +999,59 @@ class ImportRepository:
             (source_name, run_id),
         )
         return cursor.rowcount
+
+    def promote_partners(self, connection, *, source_month: str) -> None:
+        connection.execute("TRUNCATE company_partners")
+        connection.execute(
+            """
+            INSERT INTO company_partners (
+                cnpj_basico,
+                partner_identifier,
+                partner_name,
+                partner_document,
+                partner_qualification_code,
+                partner_qualification,
+                entry_date,
+                country_code,
+                legal_representative_document,
+                legal_representative_name,
+                legal_representative_qualification_code,
+                legal_representative_qualification,
+                age_range_code,
+                age_range,
+                source_month
+            )
+            SELECT
+                partner.cnpj_basico,
+                partner.partner_identifier,
+                partner.partner_name,
+                partner.partner_document,
+                partner.partner_qualification_code,
+                qualification.descricao,
+                partner.entry_date,
+                partner.country_code,
+                partner.legal_representative_document,
+                partner.legal_representative_name,
+                partner.legal_representative_qualification_code,
+                representative_qualification.descricao,
+                partner.age_range_code,
+                partner.age_range,
+                %s
+            FROM stg_company_partners AS partner
+            LEFT JOIN stg_qualificacoes AS qualification
+                ON qualification.codigo = partner.partner_qualification_code
+            LEFT JOIN stg_qualificacoes AS representative_qualification
+                ON representative_qualification.codigo =
+                   partner.legal_representative_qualification_code
+            WHERE EXISTS (
+                SELECT 1
+                FROM companies AS company
+                WHERE company.is_active = TRUE
+                  AND company.cnpj_basico = partner.cnpj_basico
+            )
+            """,
+            (source_month,),
+        )
 
     def complete_run(self, connection, *, run_id: int) -> None:
         connection.execute(
@@ -955,6 +1101,20 @@ class ImportRepository:
         active = connection.execute(
             "SELECT COUNT(*) AS count FROM companies WHERE is_active = TRUE"
         ).fetchone()
+        total_partners = connection.execute(
+            "SELECT COUNT(*) AS count FROM company_partners"
+        ).fetchone()
+        partners_by_qualification = connection.execute(
+            """
+            SELECT
+                partner_qualification_code,
+                partner_qualification,
+                COUNT(*) AS total
+            FROM company_partners
+            GROUP BY partner_qualification_code, partner_qualification
+            ORDER BY total DESC, partner_qualification_code
+            """
+        ).fetchall()
         by_uf = connection.execute(
             """
             SELECT uf, COUNT(*) AS total
@@ -984,6 +1144,12 @@ class ImportRepository:
         return {
             "total_companies": total["count"] if isinstance(total, dict) else total[0],
             "active_companies": active["count"] if isinstance(active, dict) else active[0],
+            "total_partners": (
+                total_partners["count"]
+                if isinstance(total_partners, dict)
+                else total_partners[0]
+            ),
+            "partners_by_qualification": partners_by_qualification,
             "by_uf": by_uf,
             "by_category": by_category,
             "last_import": last_run,

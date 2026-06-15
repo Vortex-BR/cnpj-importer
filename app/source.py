@@ -18,6 +18,8 @@ REQUIRED_FILE_NAMES = {
     "Municipios.zip",
     "Cnaes.zip",
     "Simples.zip",
+    *(f"Socios{index}.zip" for index in range(10)),
+    "Qualificacoes.zip",
 }
 
 

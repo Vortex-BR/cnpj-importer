@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -9,9 +8,20 @@ from typing import Iterator, Sequence
 
 from app.classifier import CategoryClassifier
 from app.downloader import DownloadResult, ResumableDownloader
-from app.models import AutoImportCheck, CompanyRecord, EstablishmentRecord
+from app.models import (
+    AutoImportCheck,
+    CompanyRecord,
+    EstablishmentRecord,
+    PartnerRecord,
+    SourceFile,
+)
 from app.normalization import normalize_nature_group
-from app.parser import parse_company_row, parse_establishment_row, stream_zip_rows
+from app.parser import (
+    parse_company_row,
+    parse_establishment_row,
+    parse_partner_row,
+    stream_zip_rows,
+)
 from app.repository import ActiveRunConflict, ImportRepository
 from app.source import NoCompleteSnapshotError, SourceCatalog, SourceManifest
 from app.worker import RunHeartbeat
@@ -34,6 +44,18 @@ class EstablishmentBatch:
     processed_rows: int
     total_rows: int
     records: tuple[EstablishmentRecord, ...]
+    errors: tuple[RowError, ...]
+
+    @property
+    def error_rows(self) -> int:
+        return len(self.errors)
+
+
+@dataclass(frozen=True)
+class PartnerBatch:
+    processed_rows: int
+    total_rows: int
+    records: tuple[PartnerRecord, ...]
     errors: tuple[RowError, ...]
 
     @property
@@ -78,6 +100,44 @@ def iter_establishment_batches(
             chunk_rows = 0
     if chunk_rows:
         yield EstablishmentBatch(
+            processed_rows,
+            chunk_rows,
+            tuple(records),
+            tuple(errors),
+        )
+
+
+def iter_partner_batches(
+    path: str | Path,
+    *,
+    batch_size: int,
+    skip_rows: int = 0,
+) -> Iterator[PartnerBatch]:
+    records: list[PartnerRecord] = []
+    errors: list[RowError] = []
+    chunk_rows = 0
+    processed_rows = skip_rows
+    for row_number, row in enumerate(stream_zip_rows(path), start=1):
+        if row_number <= skip_rows:
+            continue
+        processed_rows = row_number
+        chunk_rows += 1
+        try:
+            records.append(parse_partner_row(row))
+        except (ValueError, IndexError) as exc:
+            errors.append(RowError(None, str(exc)))
+        if chunk_rows >= batch_size:
+            yield PartnerBatch(
+                processed_rows,
+                chunk_rows,
+                tuple(records),
+                tuple(errors),
+            )
+            records.clear()
+            errors.clear()
+            chunk_rows = 0
+    if chunk_rows:
+        yield PartnerBatch(
             processed_rows,
             chunk_rows,
             tuple(records),
@@ -334,37 +394,60 @@ class ImportService:
                     ),
                 )
                 heartbeat.start()
-                downloads = self._download_manifest(
+                files_by_name = {
+                    source_file.name: source_file
+                    for source_file in manifest.files
+                }
+                self._prepare_staging(
                     connection,
                     run_id=run_id,
                     manifest=manifest,
                 )
-                self._rebuild_staging(
+                self._process_auxiliaries(
                     connection,
                     run_id=run_id,
                     source_month=source_month,
-                    downloads=downloads,
+                    manifest=manifest,
+                    files_by_name=files_by_name,
+                )
+                self._process_companies(
+                    connection,
+                    run_id=run_id,
+                    source_month=source_month,
+                    manifest=manifest,
+                    files_by_name=files_by_name,
                 )
                 self._process_establishments(
                     connection,
                     run_id=run_id,
                     source_month=source_month,
-                    downloads=downloads,
+                    manifest=manifest,
+                    files_by_name=files_by_name,
                 )
+                with connection.transaction():
+                    self.repository.truncate_company_staging(connection)
+                with connection.transaction():
+                    self._build_active_roots_table(connection)
+                self._load_partners(
+                    connection,
+                    run_id=run_id,
+                    source_month=source_month,
+                    manifest=manifest,
+                    files_by_name=files_by_name,
+                )
+                with connection.transaction():
+                    connection.execute("DROP TABLE IF EXISTS active_cnpj_roots")
                 with connection.transaction():
                     self.repository.touch_run(
                         connection,
                         run_id=run_id,
                         phase="RECONCILING",
                     )
-                with connection.transaction():
-                    self.repository.reconcile_inactive(
-                        connection,
-                        run_id=run_id,
-                        source_name=self.source_name,
-                    )
-                    self.repository.complete_run(connection, run_id=run_id)
-                    self.repository.reset_staging(connection)
+                self._finalize_snapshot(
+                    connection,
+                    run_id=run_id,
+                    source_month=source_month,
+                )
                 return True
             except Exception as exc:
                 LOGGER.exception("Importação %s falhou", run_id)
@@ -385,90 +468,173 @@ class ImportService:
                 )
                 connection.commit()
 
-    def _download_manifest(
+    def _prepare_staging(
         self,
         connection,
         *,
         run_id: int,
         manifest: SourceManifest,
-    ) -> dict[str, DownloadResult]:
+    ) -> None:
+        checkpoints = {
+            source_file.name: self.repository.get_file(
+                connection,
+                run_id=run_id,
+                file_name=source_file.name,
+            )
+            for source_file in manifest.files
+        }
+        partner_progress = any(
+            checkpoint["status"] != "PENDING"
+            or int(checkpoint.get("processed_rows") or 0) > 0
+            for file_name, checkpoint in checkpoints.items()
+            if file_name.startswith("Socios")
+        )
+        rebuildable_files = {
+            "Cnaes.zip",
+            "Municipios.zip",
+            "Naturezas.zip",
+            "Simples.zip",
+            "Qualificacoes.zip",
+            *(
+                f"Empresas{index}.zip"
+                for index in range(10)
+            ),
+        }
         with connection.transaction():
-            self.repository.touch_run(connection, run_id=run_id, phase="DOWNLOADING")
-        results: dict[str, DownloadResult] = {}
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            pending = {
-                executor.submit(
-                    self.downloader.download,
-                    manifest.source_month,
-                    source_file,
-                ): source_file
-                for source_file in manifest.files
-            }
-            for future in as_completed(pending):
-                source_file = pending[future]
-                result = future.result()
-                results[source_file.name] = result
-                with connection.transaction():
-                    self.repository.mark_downloaded(
-                        connection,
-                        run_id=run_id,
-                        file_name=source_file.name,
-                        etag=result.etag,
-                        content_length=result.content_length,
-                    )
-                LOGGER.info("Download concluído: %s", source_file.name)
-        return results
+            self.repository.touch_run(
+                connection,
+                run_id=run_id,
+                phase="STAGING",
+            )
+            if not partner_progress:
+                self.repository.reset_staging(connection)
+                for file_name in rebuildable_files:
+                    checkpoint = checkpoints.get(file_name)
+                    if checkpoint and checkpoint["status"] != "PENDING":
+                        self.repository.reset_file_checkpoint(
+                            connection,
+                            run_id=run_id,
+                            file_name=file_name,
+                        )
+        if partner_progress:
+            LOGGER.info(
+                "Run %s retomada; staging existente preservado",
+                run_id,
+            )
 
-    def _rebuild_staging(
+    def _download_one(
+        self,
+        source_month: str,
+        source_file: SourceFile,
+        *,
+        connection,
+        run_id: int,
+    ) -> DownloadResult:
+        result = self.downloader.download(source_month, source_file)
+        with connection.transaction():
+            self.repository.mark_downloaded(
+                connection,
+                run_id=run_id,
+                file_name=source_file.name,
+                etag=result.etag,
+                content_length=result.content_length,
+            )
+        LOGGER.info("Download concluído: %s", source_file.name)
+        return result
+
+    def _delete_zip(self, path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+            meta = path.with_suffix(path.suffix + ".meta.json")
+            meta.unlink(missing_ok=True)
+            LOGGER.info("ZIP removido: %s", path.name)
+        except OSError as exc:
+            LOGGER.warning("Falha ao remover ZIP %s: %s", path.name, exc)
+
+    def _process_auxiliaries(
         self,
         connection,
         *,
         run_id: int,
         source_month: str,
-        downloads: dict[str, DownloadResult],
+        manifest: SourceManifest,
+        files_by_name: dict[str, SourceFile],
     ) -> None:
-        with connection.transaction():
-            self.repository.touch_run(connection, run_id=run_id, phase="STAGING")
-            self.repository.reset_staging(connection)
-        self._load_reference(
-            connection,
-            run_id,
-            source_month,
-            "Naturezas.zip",
-            downloads["Naturezas.zip"].path,
-            "stg_naturezas",
+        del manifest
+        auxiliaries = (
+            ("Cnaes.zip", "stg_cnaes"),
+            ("Municipios.zip", "stg_municipios"),
+            ("Naturezas.zip", "stg_naturezas"),
+            ("Simples.zip", None),
+            ("Qualificacoes.zip", "stg_qualificacoes"),
         )
-        self._load_reference(
-            connection,
-            run_id,
-            source_month,
-            "Municipios.zip",
-            downloads["Municipios.zip"].path,
-            "stg_municipios",
-        )
-        self._load_reference(
-            connection,
-            run_id,
-            source_month,
-            "Cnaes.zip",
-            downloads["Cnaes.zip"].path,
-            "stg_cnaes",
-        )
-        self._load_mei(
-            connection,
-            run_id,
-            source_month,
-            downloads["Simples.zip"].path,
-        )
+        for file_name, table_name in auxiliaries:
+            checkpoint = self.repository.get_file(
+                connection,
+                run_id=run_id,
+                file_name=file_name,
+            )
+            if checkpoint["status"] == "PROCESSED":
+                LOGGER.info("%s já processado, pulando", file_name)
+                continue
+            result = self._download_one(
+                source_month,
+                files_by_name[file_name],
+                connection=connection,
+                run_id=run_id,
+            )
+            if table_name is None:
+                self._load_mei(
+                    connection,
+                    run_id,
+                    source_month,
+                    result.path,
+                )
+            else:
+                self._load_reference(
+                    connection,
+                    run_id,
+                    source_month,
+                    file_name,
+                    result.path,
+                    table_name,
+                )
+            self._delete_zip(result.path)
+
+    def _process_companies(
+        self,
+        connection,
+        *,
+        run_id: int,
+        source_month: str,
+        manifest: SourceManifest,
+        files_by_name: dict[str, SourceFile],
+    ) -> None:
+        del manifest
         for index in range(10):
             file_name = f"Empresas{index}.zip"
+            checkpoint = self.repository.get_file(
+                connection,
+                run_id=run_id,
+                file_name=file_name,
+            )
+            if checkpoint["status"] == "PROCESSED":
+                LOGGER.info("%s já processado, pulando", file_name)
+                continue
+            result = self._download_one(
+                source_month,
+                files_by_name[file_name],
+                connection=connection,
+                run_id=run_id,
+            )
             self._load_companies(
                 connection,
                 run_id,
                 source_month,
                 file_name,
-                downloads[file_name].path,
+                result.path,
             )
+            self._delete_zip(result.path)
 
     def _load_reference(
         self,
@@ -547,6 +713,7 @@ class ImportService:
             "stg_naturezas": ("codigo", "descricao", "natureza_grupo"),
             "stg_municipios": ("codigo", "descricao"),
             "stg_cnaes": ("codigo", "descricao", "categoria_macro"),
+            "stg_qualificacoes": ("codigo", "descricao"),
         }[table_name]
         with connection.transaction():
             if rows:
@@ -746,18 +913,27 @@ class ImportService:
         *,
         run_id: int,
         source_month: str,
-        downloads: dict[str, DownloadResult],
+        manifest: SourceManifest,
+        files_by_name: dict[str, SourceFile],
     ) -> None:
+        del manifest
         for index in range(10):
             file_name = f"Estabelecimentos{index}.zip"
             checkpoint = self.repository.get_file(
                 connection, run_id=run_id, file_name=file_name
             )
             if checkpoint["status"] == "PROCESSED":
+                LOGGER.info("%s já processado, pulando", file_name)
                 continue
-            skip_rows = int(checkpoint["processed_rows"])
+            skip_rows = int(checkpoint.get("processed_rows") or 0)
+            result = self._download_one(
+                source_month,
+                files_by_name[file_name],
+                connection=connection,
+                run_id=run_id,
+            )
             for batch in iter_establishment_batches(
-                downloads[file_name].path,
+                result.path,
                 batch_size=self.batch_size,
                 skip_rows=skip_rows,
             ):
@@ -811,6 +987,145 @@ class ImportService:
                 self.repository.mark_file_processed(
                     connection, run_id=run_id, file_name=file_name
                 )
+            self._delete_zip(result.path)
+
+    def _load_partners(
+        self,
+        connection,
+        *,
+        run_id: int,
+        source_month: str,
+        manifest: SourceManifest,
+        files_by_name: dict[str, SourceFile],
+    ) -> None:
+        del manifest
+        for index in range(10):
+            file_name = f"Socios{index}.zip"
+            source_file = files_by_name[file_name]
+            checkpoint = self.repository.get_file(
+                connection,
+                run_id=run_id,
+                file_name=file_name,
+            )
+            if checkpoint["status"] == "PROCESSED":
+                LOGGER.info("%s já processado, pulando", file_name)
+                continue
+
+            skip_rows = int(checkpoint.get("processed_rows") or 0)
+            result = self._download_one(
+                source_month,
+                source_file,
+                connection=connection,
+                run_id=run_id,
+            )
+            for batch in iter_partner_batches(
+                result.path,
+                batch_size=self.batch_size,
+                skip_rows=skip_rows,
+            ):
+                with connection.transaction():
+                    if batch.records:
+                        filtered = self._filter_active_partners(
+                            connection,
+                            batch.records,
+                        )
+                        if filtered:
+                            self.repository.copy_partners(connection, filtered)
+                    self._log_errors(
+                        connection,
+                        run_id,
+                        source_month,
+                        file_name,
+                        batch.errors,
+                    )
+                    self.repository.advance_file_checkpoint(
+                        connection,
+                        run_id=run_id,
+                        file_name=file_name,
+                        processed_rows=batch.processed_rows,
+                        total_delta=batch.total_rows,
+                        active_delta=0,
+                        inserted_delta=0,
+                        updated_delta=0,
+                        error_delta=batch.error_rows,
+                    )
+                LOGGER.info(
+                    "%s: %s linhas processadas",
+                    file_name,
+                    batch.processed_rows,
+                )
+            with connection.transaction():
+                self.repository.mark_file_processed(
+                    connection,
+                    run_id=run_id,
+                    file_name=file_name,
+                )
+            self._delete_zip(result.path)
+
+    def _build_active_roots_table(self, connection) -> None:
+        """Cria tabela temporária UNLOGGED com cnpj_basico de empresas ativas."""
+        connection.execute(
+            """
+            CREATE UNLOGGED TABLE IF NOT EXISTS active_cnpj_roots (
+                cnpj_basico CHAR(8) PRIMARY KEY
+            )
+            """
+        )
+        connection.execute("TRUNCATE active_cnpj_roots")
+        connection.execute(
+            """
+            INSERT INTO active_cnpj_roots (cnpj_basico)
+            SELECT DISTINCT cnpj_basico FROM companies WHERE is_active = TRUE
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_acr_cnpj_basico
+            ON active_cnpj_roots (cnpj_basico)
+            """
+        )
+
+    def _filter_active_partners(
+        self,
+        connection,
+        records: Sequence[PartnerRecord],
+    ) -> list[PartnerRecord]:
+        if not records:
+            return []
+        basicos = list({record.cnpj_basico for record in records})
+        rows = connection.execute(
+            """
+            SELECT cnpj_basico
+            FROM active_cnpj_roots
+            WHERE cnpj_basico = ANY(%s)
+            """,
+            (basicos,),
+        ).fetchall()
+        active = {
+            row["cnpj_basico"] if isinstance(row, dict) else row[0]
+            for row in rows
+        }
+        return [record for record in records if record.cnpj_basico in active]
+
+    def _finalize_snapshot(
+        self,
+        connection,
+        *,
+        run_id: int,
+        source_month: str,
+    ) -> None:
+        with connection.transaction():
+            self.repository.reconcile_inactive(
+                connection,
+                run_id=run_id,
+                source_name=self.source_name,
+            )
+            self.repository.promote_partners(
+                connection,
+                source_month=source_month,
+            )
+            self.repository.complete_run(connection, run_id=run_id)
+            self.repository.reset_staging(connection)
 
     def _log_errors(
         self,

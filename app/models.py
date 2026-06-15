@@ -26,6 +26,25 @@ class EstablishmentRecord:
     uf: str | None
     municipio_codigo: str
     situacao_cadastral: str = "ATIVA"
+    cnpj_ordem: str = ""
+    cnpj_dv: str = ""
+    is_matriz: bool = False
+
+
+@dataclass(frozen=True)
+class PartnerRecord:
+    cnpj_basico: str
+    partner_identifier: str | None
+    partner_name: str
+    partner_document: str | None
+    partner_qualification_code: str | None
+    entry_date: date | None
+    country_code: str | None
+    legal_representative_document: str | None
+    legal_representative_name: str | None
+    legal_representative_qualification_code: str | None
+    age_range_code: str | None
+    age_range: str | None
 
 
 @dataclass(frozen=True)

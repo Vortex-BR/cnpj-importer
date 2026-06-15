@@ -16,6 +16,19 @@ PORTE_MAP = {
     "05": Porte("DEMAIS", "DEMAIS"),
 }
 
+AGE_RANGE_MAP = {
+    "0": "NAO SE APLICA",
+    "1": "0 A 12 ANOS",
+    "2": "13 A 20 ANOS",
+    "3": "21 A 30 ANOS",
+    "4": "31 A 40 ANOS",
+    "5": "41 A 50 ANOS",
+    "6": "51 A 60 ANOS",
+    "7": "61 A 70 ANOS",
+    "8": "71 A 80 ANOS",
+    "9": "MAIOR DE 80 ANOS",
+}
+
 
 def strip_accents(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value or "")
@@ -82,4 +95,3 @@ def parse_capital_social(raw: str | None) -> Decimal | None:
         return Decimal(value)
     except InvalidOperation:
         return None
-

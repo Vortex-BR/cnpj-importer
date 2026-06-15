@@ -222,6 +222,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS stg_cnaes (
 CREATE UNLOGGED TABLE IF NOT EXISTS stg_estabelecimentos_ativos (
     cnpj CHAR(14) PRIMARY KEY,
     cnpj_basico CHAR(8) NOT NULL,
+    cnpj_ordem CHAR(4) NOT NULL,
+    cnpj_dv CHAR(2) NOT NULL,
+    is_matriz BOOLEAN NOT NULL,
     data_abertura DATE,
     cnae_principal VARCHAR(20),
     uf CHAR(2),

@@ -4,9 +4,20 @@ Serviço dedicado para baixar os Dados Abertos de CNPJ da Casa dos Dados/Receita
 Federal, processar os ZIPs em streaming e manter uma base PostgreSQL de
 estabelecimentos ativos.
 
-O serviço importa matrizes e filiais como CNPJs independentes. Não baixa
-arquivos de sócios e não persiste CPF, QSA, telefone, e-mail, contatos pessoais
-ou endereço completo.
+O serviço importa matrizes e filiais como CNPJs independentes e carrega o quadro
+societário dos arquivos `Socios0.zip` até `Socios9.zip`, resolvendo descrições
+com `Qualificacoes.zip`. O vínculo é feito por `cnpj_basico`.
+
+O documento do sócio é preservado como vem da fonte em `partner_document`:
+
+- `partner_identifier = 1`: CNPJ da pessoa jurídica, inclusive completo quando
+  fornecido dessa forma.
+- `partner_identifier = 2`: CPF da pessoa física exatamente como publicado.
+- `partner_identifier = 3`: documento do estrangeiro exatamente como publicado.
+
+O mesmo vale para `legal_representative_document`. Não há mascaramento,
+preenchimento ou enriquecimento. Logs e erros também mantêm CPF/CNPJ como
+recebidos. Telefone, e-mail e endereço pessoal continuam fora da importação.
 
 ## Arquitetura
 
@@ -15,21 +26,30 @@ ou endereço completo.
 - Um scheduler opcional verifica novos snapshots completos, sem fazer backfill.
 - PostgreSQL advisory lock impede duas importações simultâneas.
 - Downloads retomáveis ficam em `/data/cache/<source_month>`.
-- Empresas, MEIs e tabelas de domínio usam staging `UNLOGGED`.
+- Empresas, MEIs, sócios e tabelas de domínio usam staging `UNLOGGED`.
 - Estabelecimentos são filtrados e processados em batches sem extração do ZIP.
 - Cada batch confirma dados e checkpoint na mesma transação.
 - O CNPJ completo é a chave primária e todo merge usa `ON CONFLICT (cnpj)`.
+- A view `company_partners_full` cruza cada sócio com os estabelecimentos ativos
+  e retorna o CNPJ completo de 14 caracteres de `companies.cnpj` como
+  `company_cnpj`, sem máscara.
 
-Uma importação interrompida pode ser reiniciada. Empresas e referências são
-recarregadas no staging; arquivos de estabelecimentos continuam após a última
-linha confirmada.
+Uma importação interrompida pode ser reiniciada. Empresas, sócios e referências
+são recarregados no staging; arquivos de estabelecimentos continuam após a
+última linha confirmada.
+
+Ao concluir o snapshot, a reconciliação de atividade e a promoção dos sócios
+usam `TRUNCATE + INSERT` dentro da mesma transação. Uma falha reverte toda a
+transação e preserva `company_partners` anterior. Reprocessar o mesmo snapshot
+substitui o conteúdo e não duplica registros finais.
 
 ## Requisitos operacionais
 
 - PostgreSQL 13 ou superior.
 - Volume persistente montado em `/data`.
 - Recomendação inicial de pelo menos 10 GB livres no volume de cache.
-- Espaço adicional no PostgreSQL para `companies`, índices e staging.
+- Espaço adicional no PostgreSQL para `companies`, `company_partners`, índices
+  e uma cópia temporária completa dos sócios em staging.
 - Uma réplica do app é suficiente. Mais réplicas são protegidas pelo advisory
   lock, mas não aceleram uma única importação.
 
@@ -192,6 +212,9 @@ curl https://cnpj.example.com/stats \
   -H "X-Import-Token: $IMPORT_API_TOKEN"
 ```
 
+A resposta inclui `total_partners` e `partners_by_qualification`. Cada grupo
+contém `partner_qualification_code`, `partner_qualification` e `total`.
+
 ### Limpar cache
 
 ```bash
@@ -283,6 +306,13 @@ Não é armazenado JSON bruto das linhas.
 
 ```sql
 SELECT COUNT(*) FROM companies;
+
+SELECT COUNT(*) FROM company_partners;
+
+SELECT company_cnpj, razao_social, partner_name,
+       partner_document, partner_qualification
+FROM company_partners_full
+LIMIT 100;
 
 SELECT uf, COUNT(*)
 FROM companies
