@@ -475,20 +475,6 @@ class ImportService:
         run_id: int,
         manifest: SourceManifest,
     ) -> None:
-        checkpoints = {
-            source_file.name: self.repository.get_file(
-                connection,
-                run_id=run_id,
-                file_name=source_file.name,
-            )
-            for source_file in manifest.files
-        }
-        partner_progress = any(
-            checkpoint["status"] != "PENDING"
-            or int(checkpoint.get("processed_rows") or 0) > 0
-            for file_name, checkpoint in checkpoints.items()
-            if file_name.startswith("Socios")
-        )
         rebuildable_files = {
             "Cnaes.zip",
             "Municipios.zip",
@@ -501,6 +487,20 @@ class ImportService:
             ),
         }
         with connection.transaction():
+            checkpoints = {
+                source_file.name: self.repository.get_file(
+                    connection,
+                    run_id=run_id,
+                    file_name=source_file.name,
+                )
+                for source_file in manifest.files
+            }
+            partner_progress = any(
+                checkpoint["status"] != "PENDING"
+                or int(checkpoint.get("processed_rows") or 0) > 0
+                for file_name, checkpoint in checkpoints.items()
+                if file_name.startswith("Socios")
+            )
             self.repository.touch_run(
                 connection,
                 run_id=run_id,
@@ -522,6 +522,14 @@ class ImportService:
                 run_id,
             )
 
+    def _get_file_checkpoint(self, connection, *, run_id: int, file_name: str):
+        with connection.transaction():
+            return self.repository.get_file(
+                connection,
+                run_id=run_id,
+                file_name=file_name,
+            )
+
     def _download_one(
         self,
         source_month: str,
@@ -530,6 +538,13 @@ class ImportService:
         connection,
         run_id: int,
     ) -> DownloadResult:
+        with connection.transaction():
+            self.repository.touch_run(
+                connection,
+                run_id=run_id,
+                phase=f"DOWNLOADING:{source_file.name}",
+                file_name=source_file.name,
+            )
         result = self.downloader.download(source_month, source_file)
         with connection.transaction():
             self.repository.mark_downloaded(
@@ -569,7 +584,7 @@ class ImportService:
             ("Qualificacoes.zip", "stg_qualificacoes"),
         )
         for file_name, table_name in auxiliaries:
-            checkpoint = self.repository.get_file(
+            checkpoint = self._get_file_checkpoint(
                 connection,
                 run_id=run_id,
                 file_name=file_name,
@@ -613,7 +628,7 @@ class ImportService:
         del manifest
         for index in range(10):
             file_name = f"Empresas{index}.zip"
-            checkpoint = self.repository.get_file(
+            checkpoint = self._get_file_checkpoint(
                 connection,
                 run_id=run_id,
                 file_name=file_name,
@@ -919,7 +934,7 @@ class ImportService:
         del manifest
         for index in range(10):
             file_name = f"Estabelecimentos{index}.zip"
-            checkpoint = self.repository.get_file(
+            checkpoint = self._get_file_checkpoint(
                 connection, run_id=run_id, file_name=file_name
             )
             if checkpoint["status"] == "PROCESSED":
@@ -1002,7 +1017,7 @@ class ImportService:
         for index in range(10):
             file_name = f"Socios{index}.zip"
             source_file = files_by_name[file_name]
-            checkpoint = self.repository.get_file(
+            checkpoint = self._get_file_checkpoint(
                 connection,
                 run_id=run_id,
                 file_name=file_name,

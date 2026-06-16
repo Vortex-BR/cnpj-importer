@@ -896,7 +896,12 @@ class ImportRepository:
                 file_name,
             ),
         )
-        self.touch_run(connection, run_id=run_id, phase=f"PROCESSING:{file_name}")
+        self.touch_run(
+            connection,
+            run_id=run_id,
+            phase=f"PROCESSING:{file_name}",
+            file_name=file_name,
+        )
 
     def mark_file_processed(self, connection, *, run_id: int, file_name: str) -> None:
         connection.execute(
@@ -957,14 +962,23 @@ class ImportRepository:
         with connection.cursor() as cursor:
             cursor.executemany(query, params)
 
-    def touch_run(self, connection, *, run_id: int, phase: str) -> None:
+    def touch_run(
+        self,
+        connection,
+        *,
+        run_id: int,
+        phase: str,
+        file_name: str | None = None,
+    ) -> None:
         connection.execute(
             """
             UPDATE cnpj_import_runs
-            SET phase = %s, heartbeat_at = NOW()
+            SET phase = %s,
+                file_name = %s,
+                heartbeat_at = NOW()
             WHERE id = %s
             """,
-            (phase, run_id),
+            (phase, file_name, run_id),
         )
 
     def heartbeat_run(self, connection, *, run_id: int) -> None:
